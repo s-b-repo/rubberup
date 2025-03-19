@@ -7,7 +7,7 @@ use std::process::Command;
 
 /// Pacman package integrity checker and reinstaller
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(name = "intacheck", author, version, about, long_about = None)]
 struct Args {
     /// Enable verbose output
     #[arg(short, long)]
@@ -15,14 +15,15 @@ struct Args {
     /// Dry run: show changes but do not reinstall packages
     #[arg(long)]
     dry_run: bool,
-    /// Log file path (default: pacman_check.log in current directory)
+    /// Log file path (default: /var/log/intacheck.log)
     #[arg(short, long, value_parser)]
     log: Option<PathBuf>,
 }
 
 fn main() {
     let args = Args::parse();
-    let log_path = args.log.unwrap_or_else(|| PathBuf::from("pacman_check.log"));
+    // Default log file path: /var/log/intacheck.log (requires write permission)
+    let log_path = args.log.unwrap_or_else(|| PathBuf::from("/var/log/intacheck.log"));
     log_message(&log_path, "=== Starting pacman integrity check ===", args.verbose);
 
     let packages = get_installed_packages(args.verbose);
