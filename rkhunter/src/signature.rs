@@ -27,6 +27,7 @@ mod config {
     #[derive(Parser, Debug)]
     #[command(author, version, about, long_about = None)]
     pub struct Config {
+        
         /// URL to download Linux rootkit signatures (JSON array)
         #[arg(short, long, default_value = "https://raw.githubusercontent.com/enterprise/rootkit-signatures/main/linux.json")]
         pub linux_signatures_url: String,
@@ -42,6 +43,10 @@ mod config {
         /// Local file path to store merged signatures
         #[arg(long, default_value = "local_signatures.json")]
         pub local_signatures_path: String,
+
+            /// Override scanning of dangerous directories
+        #[arg(long)]
+        pub force_scan: bool,
     }
     
 impl Config {
