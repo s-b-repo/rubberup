@@ -1,10 +1,3 @@
-// main.rs
-// Enterprise Rootkit Scanner
-// Note: This scanner is designed for real-world use and includes additional security validations,
-// robust error handling, and increased concurrency. Replace the placeholder signature URLs with
-// actual public signature databases when deploying in production.
-
-use regex::Regex;
 use reqwest;
 use serde::{Deserialize, Serialize};
 use tokio;
@@ -17,21 +10,27 @@ use futures::stream::{self, StreamExt};
 use std::sync::Arc;
 use std::path::Path;
 use std::fs as stdfs;
+use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use hex;
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MalwareHash {
+    pub name: String,
+    pub sha256: String,
+}
 
 /// --- Configuration Module ---
-/// Instead of using clap, we now define a Config struct with default values.
 mod config {
     use super::*;
     #[derive(Debug)]
     pub struct Config {
-        /// URL to download Linux rootkit signatures (JSON array)
-        pub linux_signatures_url: String,
-        /// URL to download Windows rootkit signatures (JSON array)
-        pub windows_signatures_url: String,
+        /// URL to download the malware hash database (JSON array)
+        pub malware_hashes_url: String,
         /// Target directory to scan (do not set this to critical system directories)
         pub target_directory: String,
-        /// Local file path to store merged signatures
-        pub local_signatures_path: String,
+        /// Local file path to store the downloaded malware hashes
+        pub local_hashes_path: String,
         /// Override scanning of dangerous directories
         pub force_scan: bool,
     }
@@ -39,10 +38,10 @@ mod config {
     impl Default for Config {
         fn default() -> Self {
             Self {
-                linux_signatures_url: "https://raw.githubusercontent.com/enterprise/rootkit-signatures/main/linux.json".to_string(),
-                windows_signatures_url: "https://raw.githubusercontent.com/enterprise/rootkit-signatures/main/windows.json".to_string(),
+                // Replace the URL below with the actual endpoint of the biggest public malware hash DB.
+                malware_hashes_url: "https://example.com/malware_hashes.json".to_string(),
                 target_directory: "/var/log".to_string(),
-                local_signatures_path: "local_signatures.json".to_string(),
+                local_hashes_path: "local_hashes.json".to_string(),
                 force_scan: false,
             }
         }
@@ -51,7 +50,6 @@ mod config {
     impl Config {
         /// Validate configuration for production hardening.
         pub fn validate(&self) -> Result<(), String> {
-            // Check if the target directory is one of the dangerous ones.
             let dangerous_dirs = ["/", "/boot", "/sys", "/proc"];
             let canonical = stdfs::canonicalize(&self.target_directory)
                 .map_err(|e| format!("Failed to canonicalize target directory: {}", e))?;
@@ -64,144 +62,80 @@ mod config {
     }
 }
 
-/// --- Signature Management Module ---
-mod signature {
+/// --- Malware Hash Management Module ---
+mod hashdb {
     use super::*;
     
-    #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
-    pub struct Signature {
-        pub name: String,
-        pub pattern: String,
-    }
-    
-    /// Download rootkit signatures from a given URL.
-    pub async fn download_signatures_from_url(url: &str) -> Result<Vec<Signature>> {
-        info!("Downloading signatures from {}", url);
+    /// Download malware hashes from a given URL.
+    pub async fn download_hashes_from_url(url: &str) -> Result<Vec<MalwareHash>> {
+        info!("Downloading malware hashes from {}", url);
         let resp = reqwest::get(url)
             .await
-            .context(format!("Failed to download signatures from {}", url))?
-            .json::<Vec<Signature>>()
+            .context(format!("Failed to download hashes from {}", url))?
+            .json::<Vec<MalwareHash>>()
             .await
             .context(format!("Failed to parse JSON from {}", url))?;
         Ok(resp)
     }
     
-    /// Download signatures from multiple URLs.
-    pub async fn download_all_signatures(urls: &[&str]) -> Result<Vec<Signature>> {
-        let mut all_signatures = Vec::new();
-        for url in urls {
-            match download_signatures_from_url(url).await {
-                Ok(mut sigs) => {
-                    info!("Downloaded {} signatures from {}", sigs.len(), url);
-                    all_signatures.append(&mut sigs);
-                },
-                Err(e) => {
-                    warn!("Error downloading from {}: {}", url, e);
-                }
-            }
-        }
-        Ok(all_signatures)
-    }
-    
-    /// Load local signatures from a JSON file, if it exists.
-    pub fn load_local_signatures<P: AsRef<Path>>(path: P) -> Result<Vec<Signature>> {
-        if path.as_ref().exists() {
-            let data = stdfs::read_to_string(&path)
-                .context("Failed to read local signatures file")?;
-            let sigs = serde_json::from_str::<Vec<Signature>>(&data)
-                .context("Failed to parse local signatures JSON")?;
-            Ok(sigs)
-        } else {
-            Ok(Vec::new())
-        }
-    }
-    
-    /// Save the provided signatures to a local JSON file atomically.
-    pub fn save_local_signatures<P: AsRef<Path>>(path: P, signatures: &[Signature]) -> Result<()> {
-        let data = serde_json::to_string_pretty(signatures)
-            .context("Failed to serialize signatures")?;
-        // Write to a temporary file first for atomic update.
-        let temp_path = path.as_ref().with_extension("tmp");
-        stdfs::write(&temp_path, data)
-            .context("Failed to write signatures to temporary file")?;
-        stdfs::rename(temp_path, path)
-            .context("Failed to rename temporary signatures file")?;
-        Ok(())
-    }
-    
-    /// Merge new signatures with the local signature store, avoiding duplicates by name.
-    pub fn update_local_signatures<P: AsRef<Path>>(local_path: P, new_sigs: Vec<Signature>) -> Result<Vec<Signature>> {
-        let mut local_sigs = load_local_signatures(&local_path)?;
-        let initial_count = local_sigs.len();
-        for new_sig in new_sigs.into_iter() {
-            if !local_sigs.iter().any(|s| s.name == new_sig.name) {
-                info!("Adding new signature: {}", new_sig.name);
-                local_sigs.push(new_sig);
-            }
-        }
-        if local_sigs.len() > initial_count {
-            save_local_signatures(&local_path, &local_sigs)?;
-            info!("Local signatures updated. Total signatures: {}", local_sigs.len());
-        } else {
-            info!("No new signatures found. Local signature store remains unchanged.");
-        }
-        Ok(local_sigs)
+    /// Download malware hashes from the provided URL.
+    pub async fn get_malware_hashes(url: &str) -> Result<Vec<MalwareHash>> {
+        download_hashes_from_url(url).await
     }
 }
 
 /// --- Scanner Module ---
 mod scanner {
     use super::*;
-    use futures::stream::{self, StreamExt};
-    use std::path::PathBuf;
     
-    /// Asynchronously scan the given directory for files matching any provided signature regex.
-    pub async fn scan_directory(dir: &str, signatures: &[(signature::Signature, Regex)]) -> Result<Vec<String>> {
+    /// Asynchronously scan the given directory for malware by computing SHA256 hashes.
+    pub async fn scan_directory_for_hashes(
+        dir: &str,
+        malware_hashes: &HashMap<String, String>,
+    ) -> Result<Vec<String>> {
         let mut alerts = Vec::new();
         
-        // Recursively collect file paths using WalkDir.
-        let file_paths: Vec<PathBuf> = WalkDir::new(dir)
+        // Recursively collect file paths.
+        let file_paths: Vec<_> = WalkDir::new(dir)
             .max_depth(10)
-            .follow_links(false)
             .into_iter()
             .filter_map(|e| {
-                match e {
-                    Ok(entry) if entry.depth() <= 10 && entry.metadata().map(|m| m.is_file()).unwrap_or(false) => {
+                if let Ok(entry) = e {
+                    if entry.metadata().map(|m| m.is_file()).unwrap_or(false) {
                         Some(entry.path().to_path_buf())
-                    },
-                    Err(e) => {
-                        warn!("Failed to access a directory entry: {}", e);
+                    } else {
                         None
                     }
-                    _ => None,
+                } else {
+                    None
                 }
             })
             .collect();
         
         info!("Found {} files in '{}'", file_paths.len(), dir);
         
-        // Share the compiled signatures with tasks.
-        let sigs = Arc::new(signatures.to_vec());
-        let concurrency_limit = 20; // Increased for enterprise scanning
+        let concurrency_limit = 20;
         
         let results = stream::iter(file_paths)
             .map(|path| {
-                let sigs = sigs.clone();
+                let malware_hashes = malware_hashes.clone();
                 async move {
                     let path_display = path.display().to_string();
-                    match fs::read_to_string(&path).await {
-                        Ok(content) => {
-                            let mut file_alerts = Vec::new();
-                            for (sig, re) in sigs.iter() {
-                                if re.is_match(&content) {
-                                    file_alerts.push(format!(
-                                        "ALERT: File '{}' matches signature '{}' (pattern: {})",
-                                        path_display, sig.name, sig.pattern
-                                    ));
-                                }
+                    match fs::read(&path).await {
+                        Ok(contents) => {
+                            let mut hasher = Sha256::new();
+                            hasher.update(&contents);
+                            let result = hasher.finalize();
+                            let hash_str = hex::encode(result);
+                            if let Some(malware_name) = malware_hashes.get(&hash_str) {
+                                Ok(vec![format!(
+                                    "ALERT: File '{}' is detected as malware '{}' (hash: {})",
+                                    path_display, malware_name, hash_str
+                                )])
+                            } else {
+                                Ok(vec![])
                             }
-                            Ok(file_alerts)
-                        },
+                        }
                         Err(e) => {
                             warn!("Failed to read file {}: {}", path_display, e);
                             Ok(vec![])
@@ -224,57 +158,38 @@ mod scanner {
 }
 
 /// --- Main Application Entry Point ---
-/// This version uses the default configuration rather than parsing command-line flags.
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize structured logging.
     tracing_subscriber::fmt::init();
     
-    // Use default configuration.
     let config = config::Config::default();
     if let Err(e) = config.validate() {
         error!("Invalid configuration: {}", e);
         return Err(anyhow::anyhow!(e));
     }
     
-    info!("Starting Enterprise Rootkit Scanner...");
+    info!("Starting Enterprise Malware Scanner...");
     
-    // Define the signature database URLs.
-    let signature_urls = [
-        &config.linux_signatures_url as &str,
-        &config.windows_signatures_url as &str,
-    ];
+    // Download the malware hash database.
+    let hashes = hashdb::get_malware_hashes(&config.malware_hashes_url).await?;
     
-    // Download remote signatures concurrently.
-    let remote_signatures = signature::download_all_signatures(&signature_urls).await?;
+    info!("Downloaded {} malware hash entries.", hashes.len());
     
-    // Update the local signature store with new entries.
-    let updated_signatures = signature::update_local_signatures(&config.local_signatures_path, remote_signatures)?;
-    
-    // Compile regex patterns and log any invalid entries.
-    let mut compiled_signatures = Vec::new();
-    for sig in updated_signatures.iter() {
-        match Regex::new(&sig.pattern) {
-            Ok(re) => compiled_signatures.push((sig.clone(), re)),
-            Err(e) => warn!("Invalid regex for signature '{}': {}. Skipping this signature.", sig.name, e),
-        }
-    }
-    
-    // Ensure at least one valid signature is available.
-    if compiled_signatures.is_empty() {
-        error!("No valid signatures available. Aborting scan for security reasons.");
-        return Err(anyhow::anyhow!("No valid signatures to scan with."));
-    }
+    // Build a HashMap for quick lookup.
+    // The key is the SHA256 hash and the value is the malware name.
+    let malware_map: HashMap<String, String> = hashes
+        .into_iter()
+        .map(|mh| (mh.sha256, mh.name))
+        .collect();
     
     // Scan the target directory.
-    info!("Scanning directory '{}' for rootkit signatures...", config.target_directory);
-    let alerts = scanner::scan_directory(&config.target_directory, &compiled_signatures).await?;
+    info!("Scanning directory '{}' for malware signatures...", config.target_directory);
+    let alerts = scanner::scan_directory_for_hashes(&config.target_directory, &malware_map).await?;
     
-    // Report scan results.
     if alerts.is_empty() {
-        info!("No rootkit signatures detected.");
+        info!("No malware detected.");
     } else {
-        info!("Detected {} potential rootkit signatures:", alerts.len());
+        info!("Detected {} potential malware files:", alerts.len());
         for alert in alerts {
             println!("{}", alert);
         }
