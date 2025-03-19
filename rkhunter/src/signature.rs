@@ -44,16 +44,21 @@ mod config {
         pub local_signatures_path: String,
     }
     
-    impl Config {
-        /// Validate configuration for production hardening.
-        pub fn validate(&self) -> Result<(), String> {
-            // Prevent scanning the system root (or Windows root) to avoid accidental system compromise.
-            if self.target_directory == "/" || self.target_directory.to_lowercase() == "c:\\" {
-                return Err("Target directory cannot be the system root directory.".into());
-            }
-            Ok(())
+impl Config {
+    /// Validate configuration for production hardening.
+    pub fn validate(&self) -> Result<(), String> {
+        // Check if the target directory is one of the dangerous ones.
+        let dangerous_dirs = ["/", "/boot", "/sys", "/proc"];
+        let canonical = std::fs::canonicalize(&self.target_directory)
+            .map_err(|e| format!("Failed to canonicalize target directory: {}", e))?;
+        let target_str = canonical.to_str().unwrap_or_default();
+        if dangerous_dirs.iter().any(|&dir| target_str == dir) && !self.force_scan {
+            return Err(format!("Target directory '{}' is dangerous. Use --force-scan to override.", target_str));
         }
+        Ok(())
     }
+}
+
 }
 
 /// --- Signature Management Module ---
@@ -153,26 +158,23 @@ mod scanner {
         let mut alerts = Vec::new();
         
         // Recursively collect file paths using WalkDir.
-        let file_paths: Vec<PathBuf> = WalkDir::new(dir)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|entry| {
-                match entry {
-                    Ok(e) => {
-                        if let Ok(metadata) = e.metadata() {
-                            if metadata.is_file() {
-                                return Some(e.path().to_path_buf());
-                            }
-                        }
-                        None
-                    },
-                    Err(e) => {
-                        warn!("Failed to access a directory entry: {}", e);
-                        None
-                    }
-                }
-            })
-            .collect();
+let file_paths: Vec<PathBuf> = WalkDir::new(dir)
+    .max_depth(10)
+    .follow_links(false)
+    .into_iter()
+    .filter_map(|e| {
+        match e {
+            Ok(entry) if entry.depth() <= 10 && entry.metadata().map(|m| m.is_file()).unwrap_or(false) => {
+                Some(entry.path().to_path_buf())
+            },
+            Err(e) => {
+                warn!("Failed to access a directory entry: {}", e);
+                None
+            }
+            _ => None,
+        }
+    })
+    .collect();
         
         info!("Found {} files in '{}'", file_paths.len(), dir);
         
