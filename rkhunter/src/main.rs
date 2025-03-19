@@ -4,7 +4,6 @@
 // robust error handling, and increased concurrency. Replace the placeholder signature URLs with
 // actual public signature databases when deploying in production.
 
-use clap::Parser;
 use regex::Regex;
 use reqwest;
 use serde::{Deserialize, Serialize};
@@ -20,50 +19,49 @@ use std::path::Path;
 use std::fs as stdfs;
 
 /// --- Configuration Module ---
+/// Instead of using clap, we now define a Config struct with default values.
 mod config {
-    use clap::Parser;
-    
-    /// Enterprise Rootkit Scanner Configuration
-    #[derive(Parser, Debug)]
-    #[command(author, version, about, long_about = None)]
+    use super::*;
+    #[derive(Debug)]
     pub struct Config {
-        
         /// URL to download Linux rootkit signatures (JSON array)
-        #[arg(short, long, default_value = "https://raw.githubusercontent.com/enterprise/rootkit-signatures/main/linux.json")]
         pub linux_signatures_url: String,
-        
         /// URL to download Windows rootkit signatures (JSON array)
-        #[arg(long, default_value = "https://raw.githubusercontent.com/enterprise/rootkit-signatures/main/windows.json")]
         pub windows_signatures_url: String,
-        
         /// Target directory to scan (do not set this to critical system directories)
-        #[arg(short, long, default_value = "/var/log")]
         pub target_directory: String,
-        
         /// Local file path to store merged signatures
-        #[arg(long, default_value = "local_signatures.json")]
         pub local_signatures_path: String,
-
-            /// Override scanning of dangerous directories
-        #[arg(long)]
+        /// Override scanning of dangerous directories
         pub force_scan: bool,
     }
     
-impl Config {
-    /// Validate configuration for production hardening.
-    pub fn validate(&self) -> Result<(), String> {
-        // Check if the target directory is one of the dangerous ones.
-        let dangerous_dirs = ["/", "/boot", "/sys", "/proc"];
-        let canonical = std::fs::canonicalize(&self.target_directory)
-            .map_err(|e| format!("Failed to canonicalize target directory: {}", e))?;
-        let target_str = canonical.to_str().unwrap_or_default();
-        if dangerous_dirs.iter().any(|&dir| target_str == dir) && !self.force_scan {
-            return Err(format!("Target directory '{}' is dangerous. Use --force-scan to override.", target_str));
+    impl Default for Config {
+        fn default() -> Self {
+            Self {
+                linux_signatures_url: "https://raw.githubusercontent.com/enterprise/rootkit-signatures/main/linux.json".to_string(),
+                windows_signatures_url: "https://raw.githubusercontent.com/enterprise/rootkit-signatures/main/windows.json".to_string(),
+                target_directory: "/var/log".to_string(),
+                local_signatures_path: "local_signatures.json".to_string(),
+                force_scan: false,
+            }
         }
-        Ok(())
     }
-}
-
+    
+    impl Config {
+        /// Validate configuration for production hardening.
+        pub fn validate(&self) -> Result<(), String> {
+            // Check if the target directory is one of the dangerous ones.
+            let dangerous_dirs = ["/", "/boot", "/sys", "/proc"];
+            let canonical = stdfs::canonicalize(&self.target_directory)
+                .map_err(|e| format!("Failed to canonicalize target directory: {}", e))?;
+            let target_str = canonical.to_str().unwrap_or_default();
+            if dangerous_dirs.iter().any(|&dir| target_str == dir) && !self.force_scan {
+                return Err(format!("Target directory '{}' is dangerous. Enable force_scan to override.", target_str));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// --- Signature Management Module ---
@@ -154,7 +152,6 @@ mod signature {
 /// --- Scanner Module ---
 mod scanner {
     use super::*;
-    use tokio::fs;
     use futures::stream::{self, StreamExt};
     use std::path::PathBuf;
     
@@ -163,23 +160,23 @@ mod scanner {
         let mut alerts = Vec::new();
         
         // Recursively collect file paths using WalkDir.
-let file_paths: Vec<PathBuf> = WalkDir::new(dir)
-    .max_depth(10)
-    .follow_links(false)
-    .into_iter()
-    .filter_map(|e| {
-        match e {
-            Ok(entry) if entry.depth() <= 10 && entry.metadata().map(|m| m.is_file()).unwrap_or(false) => {
-                Some(entry.path().to_path_buf())
-            },
-            Err(e) => {
-                warn!("Failed to access a directory entry: {}", e);
-                None
-            }
-            _ => None,
-        }
-    })
-    .collect();
+        let file_paths: Vec<PathBuf> = WalkDir::new(dir)
+            .max_depth(10)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| {
+                match e {
+                    Ok(entry) if entry.depth() <= 10 && entry.metadata().map(|m| m.is_file()).unwrap_or(false) => {
+                        Some(entry.path().to_path_buf())
+                    },
+                    Err(e) => {
+                        warn!("Failed to access a directory entry: {}", e);
+                        None
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
         
         info!("Found {} files in '{}'", file_paths.len(), dir);
         
@@ -227,13 +224,14 @@ let file_paths: Vec<PathBuf> = WalkDir::new(dir)
 }
 
 /// --- Main Application Entry Point ---
+/// This version uses the default configuration rather than parsing command-line flags.
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize structured logging.
     tracing_subscriber::fmt::init();
     
-    // Parse and validate configuration.
-    let config = config::Config::parse();
+    // Use default configuration.
+    let config = config::Config::default();
     if let Err(e) = config.validate() {
         error!("Invalid configuration: {}", e);
         return Err(anyhow::anyhow!(e));
